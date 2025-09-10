@@ -365,58 +365,57 @@ class ChatterboxTTS:
 
         prompts = ["[START]" + punc_norm(p) + "[STOP]" for p in prompts]
 
-        request_ids = {}
-        requests = []
-        for i, text in enumerate(prompts):
-            rid = f"stream-{i}"
-            request_ids[rid] = i
-            requests.append({
-                "prompt": text,
-                "multi_modal_data": {"conditionals": [cond_emb]},
-                "request_id": rid,
-            })
-
-        generator = self.t3.generate(
-            requests,
-            sampling_params=SamplingParams(
-                temperature=temperature,
-                stop_token_ids=[self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET],
-                max_tokens=min(max_tokens, self.max_model_len),
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-                *args,
-                **kwargs,
-            ),
-            stream=True,
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            stop_token_ids=[self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET],
+            max_tokens=min(max_tokens, self.max_model_len),
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            *args,
+            **kwargs,
         )
+
+        for i, text in enumerate(prompts):
+            self.t3.llm_engine.add_request(
+                str(i),
+                {
+                    "prompt": text,
+                    "multi_modal_data": {"conditionals": [cond_emb]},
+                },
+                sampling_params.clone(),
+            )
 
         cache_sources: list[Optional[torch.Tensor]] = [None] * len(prompts)
         prev_lens = [0] * len(prompts)
 
         with torch.inference_mode():
-            for result in generator:
-                idx = request_ids[result.request_id]
-                output = result.outputs[0]
-                token_ids = output.token_ids
-                new_ids = token_ids[prev_lens[idx]:]
-                prev_lens[idx] = len(token_ids)
+            while self.t3.llm_engine.has_unfinished_requests():
+                step_outputs = self.t3.llm_engine.step()
+                for output in step_outputs:
+                    idx = int(output.request_id)
+                    out = output.outputs[0]
+                    token_ids = out.token_ids
+                    new_ids = token_ids[prev_lens[idx]:]
+                    prev_lens[idx] = len(token_ids)
 
-                speech_tokens = torch.tensor([
-                    token - SPEECH_TOKEN_OFFSET for token in new_ids
-                ], device="cuda")
-                speech_tokens = drop_invalid_tokens(speech_tokens)
-                speech_tokens = speech_tokens[speech_tokens < 6561]
+                    speech_tokens = torch.tensor([
+                        token - SPEECH_TOKEN_OFFSET for token in new_ids
+                    ], device="cuda")
+                    speech_tokens = drop_invalid_tokens(speech_tokens)
+                    speech_tokens = speech_tokens[speech_tokens < 6561]
 
-                finalize = output.finished
-                if len(speech_tokens) > 0 or finalize:
-                    wav, cache_sources[idx] = self.s3gen.inference(
-                        speech_tokens=speech_tokens,
-                        ref_dict=s3gen_ref,
-                        cache_source=cache_sources[idx],
-                        finalize=finalize,
-                        n_timesteps=diffusion_steps,
-                    )
-                    yield idx, wav.cpu()
+                    finalize = out.finished
+                    if len(speech_tokens) > 0 or finalize:
+                        wav, cache_sources[idx] = self.s3gen.inference(
+                            speech_tokens=speech_tokens,
+                            ref_dict=s3gen_ref,
+                            cache_source=cache_sources[idx],
+                            finalize=finalize,
+                            n_timesteps=diffusion_steps,
+                        )
+                        yield idx, wav.cpu()
+
+        torch.cuda.empty_cache()
 
     def shutdown(self):
         del self.t3
