@@ -1,0 +1,66 @@
+import asyncio
+import json
+from contextlib import suppress
+import websockets
+
+from chatterbox_vllm.ws_server import serve_tts
+
+
+class FakeTensor:
+    """Minimal tensor-like wrapper returning raw bytes for testing."""
+
+    def __init__(self, data: bytes):
+        self.data = data
+
+    def cpu(self):
+        return self
+
+    # Emulate the NumPy API used by ws_server without importing numpy
+    def numpy(self):
+        return self
+
+    def astype(self, _dtype: str):
+        return self
+
+    def tobytes(self):
+        return self.data
+
+
+class DummyTTS:
+    sr = 16000
+
+    def generate(self, prompt: str, stream: bool = False):
+        assert stream
+        chunk = b"\x00" * (1600 * 4)  # 1600 float32 samples
+        for _ in range(2):
+            yield 0, FakeTensor(chunk)
+
+
+async def run_client():
+    async with websockets.connect("ws://localhost:8765") as ws:
+        await ws.send(json.dumps({"text": "hello"}))
+        msg = await ws.recv()
+        print(msg)
+        chunks = 0
+        while True:
+            msg = await ws.recv()
+            if isinstance(msg, bytes):
+                chunks += 1
+            else:
+                print(msg)
+                break
+        print(f"received {chunks} chunks")
+
+
+async def main():
+    tts = DummyTTS()
+    server_task = asyncio.create_task(serve_tts(tts))
+    await asyncio.sleep(0.1)
+    await run_client()
+    server_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await server_task
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
