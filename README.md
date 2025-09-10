@@ -93,6 +93,39 @@ if __name__ == "__main__":
             ta.save(f"test-{i}-{audio_idx}.mp3", audio, model.sr)
 ```
 
+## Streaming Example
+
+Audio can also be generated in a streaming fashion using
+`ChatterboxTTS.generate_stream`, which yields audio chunks as they become
+available.
+
+```python
+import torchaudio as ta
+from chatterbox_vllm.tts import ChatterboxTTS
+
+model = ChatterboxTTS.from_pretrained()
+
+stream = model.generate_stream("Streaming response demo")
+for i, chunk in enumerate(stream):
+    ta.save(f"stream-{i}.mp3", chunk, model.sr)
+```
+## WebSocket Streaming API
+
+Run the WebSocket server:
+
+```bash
+python ws_tts_server.py
+```
+
+Then connect with the helper script to verify streaming:
+
+```bash
+python check_ws_stream.py
+```
+
+Each received chunk is saved as `ws-chunk-*.mp3`.
+
+
 # Benchmarks
 
 To run a benchmark, tweak and run `benchmark.py`.
