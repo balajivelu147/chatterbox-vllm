@@ -113,6 +113,34 @@ python -m chatterbox_vllm.ws_server --ckpt-dir /path/to/checkpoints
 Clients send a JSON payload like `{ "text": "Hello" }` and receive the sample rate,
 binary audio chunks, and a final `{ "event": "end" }` message.
 
+To consume the stream from another project, connect to the server (it binds to
+`ws://localhost:8765` by default) and follow the same protocol. Each connection
+should:
+
+1. Send a JSON text frame with the desired text, e.g. `{ "text": "Hi" }`.
+2. Receive a JSON frame containing the sample rate, e.g. `{ "sr": 16000 }`.
+3. Read each subsequent binary frame as a `float32` PCM audio chunk until a
+   final JSON frame `{ "event": "end" }` is emitted.
+
+Example Python client:
+
+```python
+import asyncio, json, websockets
+
+async def tts_request(text: str):
+    uri = "ws://localhost:8765"
+    async with websockets.connect(uri) as ws:
+        await ws.send(json.dumps({"text": text}))
+        sr = json.loads(await ws.recv())["sr"]
+        async for msg in ws:
+            if isinstance(msg, bytes):
+                process_chunk(msg)  # Handle raw float32 audio
+            elif json.loads(msg).get("event") == "end":
+                break
+
+asyncio.run(tts_request("Hello from another project"))
+```
+
 A lightweight test client and server using a dummy TTS are included:
 
 ```
