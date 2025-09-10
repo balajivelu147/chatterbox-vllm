@@ -1,5 +1,6 @@
 import asyncio
 import json
+from contextlib import suppress
 import websockets
 
 from chatterbox_vllm.ws_server import serve_tts
@@ -57,6 +58,8 @@ async def main():
     await asyncio.sleep(0.1)
     await run_client()
     server_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await server_task
 
 
 if __name__ == "__main__":
