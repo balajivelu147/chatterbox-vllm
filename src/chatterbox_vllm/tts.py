@@ -321,7 +321,81 @@ class ChatterboxTTS:
             print(f"[S3Gen] Wavform Generation time: {s3gen_gen_time:.2f}s")
 
             return results
-        
+
+    def generate_stream(
+        self,
+        prompt: str,
+        audio_prompt_path: Optional[str] = None,
+        exaggeration: float = 0.5,
+        temperature: float = 0.8,
+        max_tokens: int = 1000,
+        top_p: float = 0.8,
+        repetition_penalty: float = 2.0,
+        *args,
+        **kwargs,
+    ):
+        """Yield audio chunks as they are generated for a single prompt."""
+
+        s3gen_ref, cond_emb = self.get_audio_conditionals(audio_prompt_path)
+        cond_emb = self.update_exaggeration(cond_emb, exaggeration)
+
+        text = "[START]" + punc_norm(prompt) + "[STOP]"
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            stop_token_ids=[self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET],
+            max_tokens=min(max_tokens, self.max_model_len),
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            *args,
+            **kwargs,
+        )
+
+        with torch.inference_mode():
+            request = {
+                "prompt": text,
+                "multi_modal_data": {"conditionals": [cond_emb]},
+            }
+            request_id = str(next(self.t3.request_counter))
+            self.t3.llm_engine.add_request(request_id, request,
+                                           sampling_params)
+
+            speech_tokens = torch.tensor([], device="cuda", dtype=torch.long)
+            last_len = 0
+            finished = False
+            while not finished and self.t3.llm_engine.has_unfinished_requests():
+                step_outputs = self.t3.llm_engine.step()
+                for request_output in step_outputs:
+                    if request_output.request_id != request_id:
+                        continue
+                    token_ids = [
+                        t - SPEECH_TOKEN_OFFSET
+                        for t in request_output.outputs[0].token_ids
+                    ]
+                    speech_tokens = torch.tensor(token_ids, device="cuda")
+                    speech_tokens = drop_invalid_tokens(speech_tokens)
+                    speech_tokens = speech_tokens[speech_tokens < 6561]
+
+                    wav, _ = self.s3gen.inference(
+                        speech_tokens=speech_tokens,
+                        ref_dict=s3gen_ref,
+                        finalize=False,
+                    )
+                    wav = wav.cpu()
+                    if wav.shape[-1] > last_len:
+                        yield wav[:, last_len:]
+                        last_len = wav.shape[-1]
+
+                    if request_output.finished:
+                        wav, _ = self.s3gen.inference(
+                            speech_tokens=speech_tokens,
+                            ref_dict=s3gen_ref,
+                            finalize=True,
+                        )
+                        wav = wav.cpu()
+                        if wav.shape[-1] > last_len:
+                            yield wav[:, last_len:]
+                        finished = True
+
     def shutdown(self):
         del self.t3
         torch.cuda.empty_cache()
