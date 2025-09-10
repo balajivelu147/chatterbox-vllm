@@ -29,6 +29,13 @@ async def serve_tts(tts: 'ChatterboxTTS', host: str = "0.0.0.0", port: int = 876
 
 def main() -> None:
     import argparse
+    import os
+
+    # Ensure our custom tokenizer remains visible when vLLM launches
+    # its engine. Running without multiprocessing avoids the child
+    # process losing the TokenizerRegistry entries.
+    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
     from .tts import ChatterboxTTS
 
     parser = argparse.ArgumentParser(description="Chatterbox vLLM TTS WebSocket server")
