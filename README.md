@@ -93,6 +93,32 @@ if __name__ == "__main__":
             ta.save(f"test-{i}-{audio_idx}.mp3", audio, model.sr)
 ```
 
+## Streaming
+
+Pass `stream=True` to `generate` to receive audio chunks as soon as they are ready. The generator yields a tuple of the prompt index and a tensor containing the audio segment.
+
+```python
+for idx, chunk in model.generate("Hello world", stream=True):
+    ta.save(f"stream-{idx}.mp3", chunk, model.sr)
+```
+
+## WebSocket API
+
+Run a WebSocket server that streams audio chunks as they are produced:
+
+```
+python -m chatterbox_vllm.ws_server --ckpt-dir /path/to/checkpoints
+```
+
+Clients send a JSON payload like `{ "text": "Hello" }` and receive the sample rate,
+binary audio chunks, and a final `{ "event": "end" }` message.
+
+A lightweight test client and server using a dummy TTS are included:
+
+```
+python tests/test_websocket.py
+```
+
 # Benchmarks
 
 To run a benchmark, tweak and run `benchmark.py`.
