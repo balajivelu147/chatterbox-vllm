@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union, Tuple, Any
+from typing import Optional, Union, Tuple, Any, Iterator
 import time
 
 from vllm import LLM, SamplingParams
@@ -217,13 +217,15 @@ class ChatterboxTTS:
         temperature: float = 0.8,
         max_tokens=1000, # Capped at max_model_len
 
+        stream: bool = False,
+
         # From original Chatterbox HF generation args
         top_p=0.8,
         repetition_penalty=2.0,
 
         # Supports anything in https://docs.vllm.ai/en/v0.9.2/api/vllm/index.html?h=samplingparams#vllm.SamplingParams
         *args, **kwargs,
-    ) -> list[any]:
+    ) -> list[any] | Iterator[tuple[int, torch.Tensor]]:
         s3gen_ref, cond_emb = self.get_audio_conditionals(audio_prompt_path)
 
         return self.generate_with_conds(
@@ -233,6 +235,7 @@ class ChatterboxTTS:
             temperature=temperature,
             exaggeration=exaggeration,
             max_tokens=max_tokens,
+            stream=stream,
             top_p=top_p,
             repetition_penalty=repetition_penalty,
             *args, **kwargs
@@ -252,15 +255,31 @@ class ChatterboxTTS:
         # This can be as low as 2 or 3 for faster generation, though the audio quality will degrade substantially.
         diffusion_steps: int = 10,
 
+        stream: bool = False,
+
         # From original Chatterbox HF generation args
         top_p=0.8,
         repetition_penalty=2.0,
 
         # Supports anything in https://docs.vllm.ai/en/v0.9.2/api/vllm/index.html?h=samplingparams#vllm.SamplingParams
         *args, **kwargs,
-    ) -> list[any]:
+    ) -> list[any] | Iterator[tuple[int, torch.Tensor]]:
         if isinstance(prompts, str):
             prompts = [prompts]
+
+        if stream:
+            return self._stream_generate_with_conds(
+                prompts=prompts,
+                s3gen_ref=s3gen_ref,
+                cond_emb=cond_emb,
+                temperature=temperature,
+                exaggeration=exaggeration,
+                max_tokens=max_tokens,
+                diffusion_steps=diffusion_steps,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                *args, **kwargs,
+            )
 
         cond_emb = self.update_exaggeration(cond_emb, exaggeration)
 
@@ -321,7 +340,78 @@ class ChatterboxTTS:
             print(f"[S3Gen] Wavform Generation time: {s3gen_gen_time:.2f}s")
 
             return results
-        
+
+    def _stream_generate_with_conds(
+        self,
+        prompts: list[str],
+        s3gen_ref: dict[str, Any],
+        cond_emb: torch.Tensor,
+        temperature: float,
+        exaggeration: float,
+        max_tokens: int,
+        diffusion_steps: int,
+        top_p: float,
+        repetition_penalty: float,
+        *args,
+        **kwargs,
+    ) -> Iterator[tuple[int, torch.Tensor]]:
+        cond_emb = self.update_exaggeration(cond_emb, exaggeration)
+
+        prompts = ["[START]" + punc_norm(p) + "[STOP]" for p in prompts]
+
+        request_ids = {}
+        requests = []
+        for i, text in enumerate(prompts):
+            rid = f"stream-{i}"
+            request_ids[rid] = i
+            requests.append({
+                "prompt": text,
+                "multi_modal_data": {"conditionals": [cond_emb]},
+                "request_id": rid,
+            })
+
+        generator = self.t3.generate(
+            requests,
+            sampling_params=SamplingParams(
+                temperature=temperature,
+                stop_token_ids=[self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET],
+                max_tokens=min(max_tokens, self.max_model_len),
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                *args,
+                **kwargs,
+            ),
+            stream=True,
+        )
+
+        cache_sources: list[Optional[torch.Tensor]] = [None] * len(prompts)
+        prev_lens = [0] * len(prompts)
+
+        with torch.inference_mode():
+            for result in generator:
+                idx = request_ids[result.request_id]
+                output = result.outputs[0]
+                token_ids = output.token_ids
+                new_ids = token_ids[prev_lens[idx]:]
+                prev_lens[idx] = len(token_ids)
+
+                speech_tokens = torch.tensor([
+                    token - SPEECH_TOKEN_OFFSET for token in new_ids
+                ], device="cuda")
+                speech_tokens = drop_invalid_tokens(speech_tokens)
+                speech_tokens = speech_tokens[speech_tokens < 6561]
+
+                finalize = output.finished
+                if len(speech_tokens) > 0 or finalize:
+                    wav, cache_sources[idx] = self.s3gen.inference(
+                        speech_tokens=speech_tokens,
+                        ref_dict=s3gen_ref,
+                        cache_source=cache_sources[idx],
+                        finalize=finalize,
+                        n_timesteps=diffusion_steps,
+                    )
+                    yield idx, wav.cpu()
+
     def shutdown(self):
         del self.t3
         torch.cuda.empty_cache()
