@@ -1,20 +1,28 @@
 import asyncio
 import json
-import numpy as np
 import websockets
 
 from chatterbox_vllm.ws_server import serve_tts
 
 
 class FakeTensor:
-    def __init__(self, arr):
-        self.arr = arr
+    """Minimal tensor-like wrapper returning raw bytes for testing."""
+
+    def __init__(self, data: bytes):
+        self.data = data
 
     def cpu(self):
         return self
 
+    # Emulate the NumPy API used by ws_server without importing numpy
     def numpy(self):
-        return self.arr
+        return self
+
+    def astype(self, _dtype: str):
+        return self
+
+    def tobytes(self):
+        return self.data
 
 
 class DummyTTS:
@@ -22,8 +30,9 @@ class DummyTTS:
 
     def generate(self, prompt: str, stream: bool = False):
         assert stream
+        chunk = b"\x00" * (1600 * 4)  # 1600 float32 samples
         for _ in range(2):
-            yield 0, FakeTensor(np.zeros(1600, dtype="float32"))
+            yield 0, FakeTensor(chunk)
 
 
 async def run_client():
