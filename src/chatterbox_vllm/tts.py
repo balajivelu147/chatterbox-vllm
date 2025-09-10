@@ -351,43 +351,50 @@ class ChatterboxTTS:
         )
 
         with torch.inference_mode():
-            generator = self.t3.generate(
-                [
-                    {
-                        "prompt": text,
-                        "multi_modal_data": {"conditionals": [cond_emb]},
-                    }
-                ],
-                sampling_params=sampling_params,
-                stream=True,
-            )
+            request = {
+                "prompt": text,
+                "multi_modal_data": {"conditionals": [cond_emb]},
+            }
+            request_id = str(next(self.t3.request_counter))
+            self.t3.llm_engine.add_request(request_id, request,
+                                           sampling_params)
 
             speech_tokens = torch.tensor([], device="cuda", dtype=torch.long)
             last_len = 0
-            for request_output in generator:
-                token_ids = [t - SPEECH_TOKEN_OFFSET for t in request_output.outputs[0].token_ids]
-                speech_tokens = torch.tensor(token_ids, device="cuda")
-                speech_tokens = drop_invalid_tokens(speech_tokens)
-                speech_tokens = speech_tokens[speech_tokens < 6561]
+            finished = False
+            while not finished and self.t3.llm_engine.has_unfinished_requests():
+                step_outputs = self.t3.llm_engine.step()
+                for request_output in step_outputs:
+                    if request_output.request_id != request_id:
+                        continue
+                    token_ids = [
+                        t - SPEECH_TOKEN_OFFSET
+                        for t in request_output.outputs[0].token_ids
+                    ]
+                    speech_tokens = torch.tensor(token_ids, device="cuda")
+                    speech_tokens = drop_invalid_tokens(speech_tokens)
+                    speech_tokens = speech_tokens[speech_tokens < 6561]
 
-                wav, _ = self.s3gen.inference(
-                    speech_tokens=speech_tokens,
-                    ref_dict=s3gen_ref,
-                    finalize=False,
-                )
-                wav = wav.cpu()
-                if wav.shape[-1] > last_len:
-                    yield wav[:, last_len:]
-                    last_len = wav.shape[-1]
+                    wav, _ = self.s3gen.inference(
+                        speech_tokens=speech_tokens,
+                        ref_dict=s3gen_ref,
+                        finalize=False,
+                    )
+                    wav = wav.cpu()
+                    if wav.shape[-1] > last_len:
+                        yield wav[:, last_len:]
+                        last_len = wav.shape[-1]
 
-            wav, _ = self.s3gen.inference(
-                speech_tokens=speech_tokens,
-                ref_dict=s3gen_ref,
-                finalize=True,
-            )
-            wav = wav.cpu()
-            if wav.shape[-1] > last_len:
-                yield wav[:, last_len:]
+                    if request_output.finished:
+                        wav, _ = self.s3gen.inference(
+                            speech_tokens=speech_tokens,
+                            ref_dict=s3gen_ref,
+                            finalize=True,
+                        )
+                        wav = wav.cpu()
+                        if wav.shape[-1] > last_len:
+                            yield wav[:, last_len:]
+                        finished = True
 
     def shutdown(self):
         del self.t3
