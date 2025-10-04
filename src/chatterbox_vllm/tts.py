@@ -109,8 +109,14 @@ class ChatterboxTTS:
         t3_speech_pos_emb.load_state_dict({ k.replace('speech_pos_emb.', ''):v for k,v in t3_weights.items() if k.startswith('speech_pos_emb.') })
         t3_speech_pos_emb = t3_speech_pos_emb.to(device=target_device).eval()
 
-        total_gpu_memory = torch.cuda.get_device_properties(0).total_memory
-        unused_gpu_memory = max(total_gpu_memory - torch.cuda.memory_allocated(), 1)
+        if torch.cuda.is_available():
+            try:
+                unused_gpu_memory = torch.cuda.mem_get_info()[0]
+            except RuntimeError:
+                total_gpu_memory = torch.cuda.get_device_properties(0).total_memory
+                unused_gpu_memory = max(total_gpu_memory - torch.cuda.memory_allocated(), 1)
+        else:
+            unused_gpu_memory = 1
 
         # Heuristic: rough calculation for what percentage of GPU memory to give to vLLM.
         # Tune this until the 'Maximum concurrency for ___ tokens per request: ___x' is just over 1.
@@ -120,7 +126,7 @@ class ChatterboxTTS:
         )
         # Clamp the utilization so vLLM never requests more memory than available, which
         # can otherwise surface as CUDA device-side asserts during engine start-up.
-        vllm_memory_percent = min(0.9, max(0.01, vllm_memory_needed / unused_gpu_memory))
+        vllm_memory_percent = min(0.5, max(0.01, vllm_memory_needed / unused_gpu_memory))
 
         print(
             "Giving vLLM "
