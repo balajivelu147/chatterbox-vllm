@@ -159,9 +159,16 @@ class ChatterboxTTS:
                 ) from exc
             swap_space = max(0.0, swap_space)
 
+        attention_backend = os.getenv("CHATTERBOX_VLLM_ATTENTION_BACKEND")
+        if attention_backend:
+            attention_backend = attention_backend.strip()
+        else:
+            attention_backend = "math"
+
         print(
             "Configuring vLLM with GPU memory utilization "
-            f"{gpu_memory_utilization * 100:.2f}% and swap space {swap_space:.1f} GB"
+            f"{gpu_memory_utilization * 100:.2f}% and swap space {swap_space:.1f} GB "
+            f"using attention backend '{attention_backend}'"
         )
 
         # Hard-cap vLLM to a single sequence so the initial profiling run does
@@ -181,6 +188,7 @@ class ChatterboxTTS:
             "max_num_seqs": max_num_seqs,
             "max_num_batched_tokens": max_model_len * max_num_seqs,
             "swap_space": swap_space,
+            "attention_backend": attention_backend,
         }
 
         t3 = LLM(**{**base_vllm_kwargs, **kwargs})
