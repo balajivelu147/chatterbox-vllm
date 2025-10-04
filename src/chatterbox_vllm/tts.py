@@ -111,12 +111,12 @@ class ChatterboxTTS:
 
         if torch.cuda.is_available():
             try:
-                unused_gpu_memory = torch.cuda.mem_get_info()[0]
+                free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info()
             except RuntimeError:
                 total_gpu_memory = torch.cuda.get_device_properties(0).total_memory
-                unused_gpu_memory = max(total_gpu_memory - torch.cuda.memory_allocated(), 1)
+                free_gpu_memory = max(total_gpu_memory - torch.cuda.memory_allocated(), 1)
         else:
-            unused_gpu_memory = 1
+            free_gpu_memory = total_gpu_memory = 1
 
         # Heuristic: rough calculation for what percentage of GPU memory to give to vLLM.
         # Tune this until the 'Maximum concurrency for ___ tokens per request: ___x' is just over 1.
@@ -124,9 +124,12 @@ class ChatterboxTTS:
         vllm_memory_needed = (1.55 * 1024 * 1024 * 1024) + (
             max_batch_size * max_model_len * 1024 * 128
         )
-        # Clamp the utilization so vLLM never requests more memory than available, which
-        # can otherwise surface as CUDA device-side asserts during engine start-up.
-        vllm_memory_percent = min(0.5, max(0.01, vllm_memory_needed / unused_gpu_memory))
+        # Clamp utilization using the total GPU memory because vLLM reserves a
+        # percentage of the full device, but also ensure we never exceed the
+        # actually free memory so startup avoids device-side CUDA assertions.
+        requested_fraction = vllm_memory_needed / max(total_gpu_memory, 1)
+        available_fraction = free_gpu_memory / max(total_gpu_memory, 1)
+        vllm_memory_percent = min(0.5, max(0.01, min(requested_fraction, available_fraction * 0.9)))
 
         print(
             "Giving vLLM "
