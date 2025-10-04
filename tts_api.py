@@ -8,14 +8,13 @@ import io
 import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import Optional
 
 import torchaudio
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-import torch
 
 from chatterbox_vllm.tts import ChatterboxTTS
 
@@ -100,7 +99,7 @@ def _resolve_max_workers() -> int:
 def _resolve_base_max_model_len() -> int:
     raw_value = os.getenv("CHATTERBOX_TTS_MAX_MODEL_LEN")
     if raw_value is None:
-        return 1000
+        return 500
     try:
         parsed = int(raw_value)
     except ValueError as exc:
@@ -108,124 +107,19 @@ def _resolve_base_max_model_len() -> int:
     return max(64, parsed)
 
 
-def _max_model_len_candidates(base: int) -> List[int]:
-    base = max(64, base)
-    values = {base, 64}
-
-    step = 128
-    cursor = base
-    while cursor - step >= 64:
-        cursor -= step
-        values.add(cursor)
-
-    cursor = base
-    while cursor > 64:
-        cursor = max(cursor // 2, 64)
-        values.add(cursor)
-        if cursor == 64:
-            break
-
-    return sorted(values)
-
-
-def _gpu_utilization_candidates() -> List[float]:
-    override = os.getenv("CHATTERBOX_VLLM_GPU_UTILIZATION")
-    if override is not None:
-        try:
-            return [float(override)]
-        except ValueError as exc:
-            raise ValueError(
-                "CHATTERBOX_VLLM_GPU_UTILIZATION must be a floating point value"
-            ) from exc
-
-    return [
-        0.10,
-        0.12,
-        0.14,
-        0.16,
-        0.18,
-        0.20,
-        0.22,
-        0.25,
-        0.28,
-        0.32,
-        0.36,
-        0.40,
-        0.45,
-        0.50,
-    ]
-
-
-def _is_fatal_cuda_error(exc: Exception) -> bool:
-    if not isinstance(exc, RuntimeError):
-        return False
-    message = str(exc)
-    return (
-        "device-side assert triggered" in message
-        or "CUBLAS_STATUS_NOT_INITIALIZED" in message
-    )
-
-
-def _load_model_with_backoff() -> ChatterboxTTS:
-    base_max_len = _resolve_base_max_model_len()
-    max_len_candidates = _max_model_len_candidates(base_max_len)
-    gpu_util_candidates = _gpu_utilization_candidates()
-
-    prior_gpu_env = os.getenv("CHATTERBOX_VLLM_GPU_UTILIZATION")
-    last_error: Optional[Exception] = None
-    attempt_messages: List[str] = []
-
-    for gpu_util in gpu_util_candidates:
-        gpu_util_str = f"{gpu_util:.3f}"
-        if prior_gpu_env is None:
-            os.environ["CHATTERBOX_VLLM_GPU_UTILIZATION"] = gpu_util_str
-
-        for max_len in max_len_candidates:
-            print(
-                "Attempting to load Chatterbox TTS "
-                f"(max_model_len={max_len}, gpu_util={gpu_util_str})"
-            )
-            try:
-                model = ChatterboxTTS.from_pretrained(
-                    max_batch_size=1,
-                    max_model_len=max_len,
-                )
-                if prior_gpu_env is None:
-                    os.environ["CHATTERBOX_VLLM_GPU_UTILIZATION"] = gpu_util_str
-                return model
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-                attempt_messages.append(
-                    f"max_model_len={max_len}, gpu_util={gpu_util_str}: {exc}"
-                )
-                if _is_fatal_cuda_error(exc):
-                    details = "\n".join(attempt_messages[-3:])
-                    raise RuntimeError(
-                        "Encountered a fatal CUDA error while initializing the TTS model. "
-                        "Please restart the process and try a smaller CHATTERBOX_TTS_MAX_MODEL_LEN "
-                        "or GPU budget via CHATTERBOX_VLLM_GPU_UTILIZATION. "
-                        f"Recent attempts:\n{details}"
-                    ) from exc
-                if torch.cuda.is_available():
-                    try:
-                        torch.cuda.empty_cache()
-                    except RuntimeError:
-                        pass
-
-        if prior_gpu_env is None:
-            os.environ["CHATTERBOX_VLLM_GPU_UTILIZATION"] = gpu_util_str
-
-    if prior_gpu_env is not None:
-        os.environ["CHATTERBOX_VLLM_GPU_UTILIZATION"] = prior_gpu_env
-    else:
-        os.environ.pop("CHATTERBOX_VLLM_GPU_UTILIZATION", None)
-
-    details = "\n".join(attempt_messages[-3:])
-    raise RuntimeError(
-        "Failed to initialize the Chatterbox TTS model after trying multiple "
-        "GPU memory budgets and context lengths. "
-        f"Last error: {last_error}. Recent attempts:\n{details}"
-    ) from last_error
+def _load_model() -> ChatterboxTTS:
+    max_len = _resolve_base_max_model_len()
+    try:
+        return ChatterboxTTS.from_pretrained(
+            max_batch_size=1,
+            max_model_len=max_len,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            "Failed to initialize the Chatterbox TTS model. "
+            "Try lowering CHATTERBOX_TTS_MAX_MODEL_LEN or set a smaller "
+            "CHATTERBOX_VLLM_GPU_UTILIZATION before starting the server."
+        ) from exc
 
 
 def create_app() -> FastAPI:
@@ -236,7 +130,7 @@ def create_app() -> FastAPI:
         try:
             model = await loop.run_in_executor(
                 executor,
-                _load_model_with_backoff,
+                _load_model,
             )
         except Exception:
             executor.shutdown(wait=True, cancel_futures=True)
