@@ -131,10 +131,21 @@ class ChatterboxTTS:
                 if total_gpu_memory > 0:
                     available_fraction = free_gpu_memory / total_gpu_memory
                     if available_fraction < gpu_memory_utilization:
-                        # Leave a small safety margin so vLLM does not overrun
-                        # the currently free VRAM, but never drop below 5%
-                        # unless the override environment variable is set.
-                        gpu_memory_utilization = max(0.05, available_fraction * 0.9)
+                        adjusted_fraction = available_fraction * 0.9
+                        if adjusted_fraction < 0.1:
+                            print(
+                                "Warning: less than 12% of GPU memory is currently free; "
+                                "the loader will still request 10% for vLLM. Consider freeing "
+                                "additional VRAM or exporting CHATTERBOX_VLLM_GPU_UTILIZATION "
+                                "to skip the automatic backoff."
+                            )
+                            gpu_memory_utilization = 0.1
+                        else:
+                            gpu_memory_utilization = adjusted_fraction
+                            print(
+                                "Reducing vLLM GPU utilization to "
+                                f"{gpu_memory_utilization * 100:.2f}% based on free memory."
+                            )
 
         swap_space_env = os.getenv("CHATTERBOX_VLLM_SWAP_SPACE_GB")
         if swap_space_env is None:
