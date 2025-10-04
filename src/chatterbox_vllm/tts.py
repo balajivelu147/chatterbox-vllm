@@ -1,16 +1,16 @@
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional, Union, Tuple, Any
+import os
 import time
-
-from vllm import LLM, SamplingParams
+from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
+from typing import Any, Optional, Tuple, Union
 
 import librosa
 import torch
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
+from vllm import LLM, SamplingParams
 
 from chatterbox_vllm.models.t3.modules.t3_config import T3Config
 
@@ -109,32 +109,48 @@ class ChatterboxTTS:
         t3_speech_pos_emb.load_state_dict({ k.replace('speech_pos_emb.', ''):v for k,v in t3_weights.items() if k.startswith('speech_pos_emb.') })
         t3_speech_pos_emb = t3_speech_pos_emb.to(device=target_device).eval()
 
-        if torch.cuda.is_available():
+        gpu_util_env = os.getenv("CHATTERBOX_VLLM_GPU_UTILIZATION")
+        gpu_memory_utilization: float
+        if gpu_util_env is not None:
             try:
-                free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info()
-            except RuntimeError:
-                total_gpu_memory = torch.cuda.get_device_properties(0).total_memory
-                free_gpu_memory = max(total_gpu_memory - torch.cuda.memory_allocated(), 1)
+                gpu_memory_utilization = float(gpu_util_env)
+            except ValueError as exc:
+                raise ValueError(
+                    "CHATTERBOX_VLLM_GPU_UTILIZATION must be a floating point value"
+                ) from exc
+            gpu_memory_utilization = max(0.01, min(0.5, gpu_memory_utilization))
         else:
-            free_gpu_memory = total_gpu_memory = 1
+            gpu_memory_utilization = 0.5
+            if torch.cuda.is_available():
+                try:
+                    free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info()
+                except RuntimeError:
+                    total_gpu_memory = torch.cuda.get_device_properties(0).total_memory
+                    free_gpu_memory = max(total_gpu_memory - torch.cuda.memory_allocated(), 1)
 
-        # Heuristic: rough calculation for what percentage of GPU memory to give to vLLM.
-        # Tune this until the 'Maximum concurrency for ___ tokens per request: ___x' is just over 1.
-        # This rough heuristic gives 1.55GB for the model weights plus 128KB per token.
-        vllm_memory_needed = (1.55 * 1024 * 1024 * 1024) + (
-            max_batch_size * max_model_len * 1024 * 128
-        )
-        # Clamp utilization using the total GPU memory because vLLM reserves a
-        # percentage of the full device, but also ensure we never exceed the
-        # actually free memory so startup avoids device-side CUDA assertions.
-        requested_fraction = vllm_memory_needed / max(total_gpu_memory, 1)
-        available_fraction = free_gpu_memory / max(total_gpu_memory, 1)
-        vllm_memory_percent = min(0.5, max(0.01, min(requested_fraction, available_fraction * 0.9)))
+                if total_gpu_memory > 0:
+                    available_fraction = free_gpu_memory / total_gpu_memory
+                    if available_fraction < gpu_memory_utilization:
+                        # Leave a small safety margin so vLLM does not overrun
+                        # the currently free VRAM, but never drop below 5%
+                        # unless the override environment variable is set.
+                        gpu_memory_utilization = max(0.05, available_fraction * 0.9)
+
+        swap_space_env = os.getenv("CHATTERBOX_VLLM_SWAP_SPACE_GB")
+        if swap_space_env is None:
+            swap_space = 4.0
+        else:
+            try:
+                swap_space = float(swap_space_env)
+            except ValueError as exc:
+                raise ValueError(
+                    "CHATTERBOX_VLLM_SWAP_SPACE_GB must be a floating point value"
+                ) from exc
+            swap_space = max(0.0, swap_space)
 
         print(
-            "Giving vLLM "
-            f"{vllm_memory_percent * 100:.2f}% of GPU memory "
-            f"({vllm_memory_needed / 1024**2:.2f} MB)"
+            "Configuring vLLM with GPU memory utilization "
+            f"{gpu_memory_utilization * 100:.2f}% and swap space {swap_space:.1f} GB"
         )
 
         # Hard-cap vLLM to a single sequence so the initial profiling run does
@@ -148,11 +164,12 @@ class ChatterboxTTS:
             "task": "generate",
             "tokenizer": "EnTokenizer",
             "tokenizer_mode": "custom",
-            "gpu_memory_utilization": vllm_memory_percent,
+            "gpu_memory_utilization": gpu_memory_utilization,
             "enforce_eager": not compile,
             "max_model_len": max_model_len,
             "max_num_seqs": max_num_seqs,
             "max_num_batched_tokens": max_model_len * max_num_seqs,
+            "swap_space": swap_space,
         }
 
         t3 = LLM(**{**base_vllm_kwargs, **kwargs})

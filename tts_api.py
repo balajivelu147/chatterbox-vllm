@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from typing import Optional
 
 import torchaudio
@@ -81,29 +83,47 @@ def _synthesize_speech(model: ChatterboxTTS, request: TTSRequest) -> io.BytesIO:
     return buffer
 
 
+def _resolve_max_workers() -> int:
+    workers_env = os.getenv("CHATTERBOX_TTS_WORKERS")
+    if workers_env is None:
+        return 4
+    try:
+        value = int(workers_env)
+    except ValueError as exc:
+        raise ValueError("CHATTERBOX_TTS_WORKERS must be an integer") from exc
+    return max(1, value)
+
+
 def create_app() -> FastAPI:
-    app = FastAPI(title="Chatterbox TTS API")
-
-    @app.on_event("startup")
-    async def _startup() -> None:
-        app.state.executor = ThreadPoolExecutor(max_workers=4)
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        executor = ThreadPoolExecutor(max_workers=_resolve_max_workers())
         loop = asyncio.get_running_loop()
-        app.state.model = await loop.run_in_executor(
-            app.state.executor,
-            lambda: ChatterboxTTS.from_pretrained(
-                max_batch_size=3,
-                max_model_len=1000,
-            ),
-        )
+        try:
+            model = await loop.run_in_executor(
+                executor,
+                lambda: ChatterboxTTS.from_pretrained(
+                    max_model_len=1000,
+                ),
+            )
+        except Exception:
+            executor.shutdown(wait=True, cancel_futures=True)
+            raise
 
-    @app.on_event("shutdown")
-    async def _shutdown() -> None:
-        model: Optional[ChatterboxTTS] = getattr(app.state, "model", None)
-        if model is not None:
-            model.shutdown()
-        executor: Optional[ThreadPoolExecutor] = getattr(app.state, "executor", None)
-        if executor is not None:
-            executor.shutdown(wait=True)
+        app.state.executor = executor
+        app.state.model = model
+
+        try:
+            yield
+        finally:
+            model = getattr(app.state, "model", None)
+            if model is not None:
+                model.shutdown()
+            executor = getattr(app.state, "executor", None)
+            if executor is not None:
+                executor.shutdown(wait=True)
+
+    app = FastAPI(title="Chatterbox TTS API", lifespan=lifespan)
 
     @app.post("/tts", response_class=StreamingResponse)
     async def synthesize(request: TTSRequest) -> StreamingResponse:
