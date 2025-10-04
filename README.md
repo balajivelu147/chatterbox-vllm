@@ -77,7 +77,7 @@ python tts_api.py
 
 The server starts on port `8021` by default and provides a `POST /tts` endpoint that accepts JSON payloads with the text to synthesize and returns a WAV audio stream in the response body.
 
-> **Note:** The loader automatically caps vLLM's GPU memory utilization at 50% of the GPU's total VRAM and further shrinks the reservation if less than 90% of that share is currently free. If you still encounter memory errors, reduce the request batch size or set `gpu_memory_utilization` manually when constructing `ChatterboxTTS`.
+> **Note:** The loader automatically caps vLLM's GPU memory utilization at 50% of the GPU's total VRAM, shrinks the reservation if less than 90% of that slice is free, and limits vLLM to processing a single sequence at a time. If you still encounter memory errors, reduce the request batch size or set `gpu_memory_utilization` manually when constructing `ChatterboxTTS`.
 
 ```python
 import torchaudio as ta

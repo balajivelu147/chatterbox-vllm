@@ -85,7 +85,7 @@ class ChatterboxTTS:
     @classmethod
     def from_local(cls, ckpt_dir: str | Path, target_device: str = "cuda", 
                    max_model_len: int = 1000, compile: bool = False,
-                   max_batch_size: int = 10,
+                   max_batch_size: int = 1,
 
                    # Original Chatterbox defaults this to False. I don't see a substantial performance difference when running with FP16.
                    s3gen_use_fp16: bool = False,
@@ -137,6 +137,12 @@ class ChatterboxTTS:
             f"({vllm_memory_needed / 1024**2:.2f} MB)"
         )
 
+        # Hard-cap vLLM to a single sequence so the initial profiling run does
+        # not reserve more KV cache blocks than the limited VRAM budget can
+        # sustain. Combined with the lower GPU memory utilization this avoids
+        # the CUDA device-side assertions observed during startup.
+        max_num_seqs = 1
+
         base_vllm_kwargs = {
             "model": "./t3-model",
             "task": "generate",
@@ -145,6 +151,8 @@ class ChatterboxTTS:
             "gpu_memory_utilization": vllm_memory_percent,
             "enforce_eager": not compile,
             "max_model_len": max_model_len,
+            "max_num_seqs": max_num_seqs,
+            "max_num_batched_tokens": max_model_len * max_num_seqs,
         }
 
         t3 = LLM(**{**base_vllm_kwargs, **kwargs})
