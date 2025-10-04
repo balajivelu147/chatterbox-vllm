@@ -67,6 +67,16 @@ If you encounter CUDA issues, try resetting the venv and using `uv pip install -
 
 [This example](https://github.com/randombk/chatterbox-vllm/blob/master/example-tts.py) can be run with `python example-tts.py` to generate audio samples for three different prompts using three different voices.
 
+### HTTP API
+
+To expose the model over HTTP, run the included FastAPI application with Uvicorn:
+
+```bash
+python tts_api.py
+```
+
+The server starts on port `8021` by default and provides a `POST /tts` endpoint that accepts JSON payloads with the text to synthesize and returns a WAV audio stream in the response body.
+
 ```python
 import torchaudio as ta
 from chatterbox_vllm.tts import ChatterboxTTS
