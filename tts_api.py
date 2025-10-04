@@ -110,7 +110,7 @@ def _resolve_base_max_model_len() -> int:
 
 def _max_model_len_candidates(base: int) -> List[int]:
     base = max(64, base)
-    values = {base}
+    values = {base, 64}
 
     step = 128
     cursor = base
@@ -125,7 +125,7 @@ def _max_model_len_candidates(base: int) -> List[int]:
         if cursor == 64:
             break
 
-    return sorted(values, reverse=True)
+    return sorted(values)
 
 
 def _gpu_utilization_candidates() -> List[float]:
@@ -139,21 +139,31 @@ def _gpu_utilization_candidates() -> List[float]:
             ) from exc
 
     return [
-        0.50,
-        0.45,
-        0.40,
-        0.36,
-        0.32,
-        0.28,
-        0.25,
-        0.22,
-        0.20,
-        0.18,
-        0.16,
-        0.14,
-        0.12,
         0.10,
+        0.12,
+        0.14,
+        0.16,
+        0.18,
+        0.20,
+        0.22,
+        0.25,
+        0.28,
+        0.32,
+        0.36,
+        0.40,
+        0.45,
+        0.50,
     ]
+
+
+def _is_fatal_cuda_error(exc: Exception) -> bool:
+    if not isinstance(exc, RuntimeError):
+        return False
+    message = str(exc)
+    return (
+        "device-side assert triggered" in message
+        or "CUBLAS_STATUS_NOT_INITIALIZED" in message
+    )
 
 
 def _load_model_with_backoff() -> ChatterboxTTS:
@@ -188,8 +198,19 @@ def _load_model_with_backoff() -> ChatterboxTTS:
                 attempt_messages.append(
                     f"max_model_len={max_len}, gpu_util={gpu_util_str}: {exc}"
                 )
+                if _is_fatal_cuda_error(exc):
+                    details = "\n".join(attempt_messages[-3:])
+                    raise RuntimeError(
+                        "Encountered a fatal CUDA error while initializing the TTS model. "
+                        "Please restart the process and try a smaller CHATTERBOX_TTS_MAX_MODEL_LEN "
+                        "or GPU budget via CHATTERBOX_VLLM_GPU_UTILIZATION. "
+                        f"Recent attempts:\n{details}"
+                    ) from exc
                 if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                    try:
+                        torch.cuda.empty_cache()
+                    except RuntimeError:
+                        pass
 
         if prior_gpu_env is None:
             os.environ["CHATTERBOX_VLLM_GPU_UTILIZATION"] = gpu_util_str
