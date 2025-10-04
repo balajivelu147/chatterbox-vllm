@@ -188,10 +188,21 @@ class ChatterboxTTS:
             "max_num_seqs": max_num_seqs,
             "max_num_batched_tokens": max_model_len * max_num_seqs,
             "swap_space": swap_space,
-            "attention_backend": attention_backend,
         }
+        base_vllm_kwargs_with_backend = {**base_vllm_kwargs, "attention_backend": attention_backend}
 
-        t3 = LLM(**{**base_vllm_kwargs, **kwargs})
+        try:
+            t3 = LLM(**{**base_vllm_kwargs_with_backend, **kwargs})
+        except TypeError as exc:
+            if "attention_backend" not in str(exc):
+                raise
+
+            print(
+                "Installed vLLM does not accept 'attention_backend'; "
+                "falling back to the VLLM_ATTENTION_BACKEND environment variable."
+            )
+            os.environ["VLLM_ATTENTION_BACKEND"] = attention_backend
+            t3 = LLM(**{**base_vllm_kwargs, **kwargs})
 
         ve = VoiceEncoder()
         ve.load_state_dict(load_file(ckpt_dir / "ve.safetensors"))
