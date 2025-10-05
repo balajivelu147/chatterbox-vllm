@@ -93,6 +93,30 @@ if __name__ == "__main__":
             ta.save(f"test-{i}-{audio_idx}.mp3", audio, model.sr)
 ```
 
+# FastAPI Server
+
+The project ships with a lightweight FastAPI application that can be served with Uvicorn for concurrent inference workloads. The server loads a single shared `ChatterboxTTS` instance and handles multiple requests in parallel using a thread pool.
+
+Start the server with:
+
+```
+uvicorn chatterbox_vllm.api:app --host 0.0.0.0 --port 8000
+```
+
+Set `CHATTERBOX_CKPT_DIR` to reuse existing checkpoints, or `CHATTERBOX_TARGET_DEVICE` to override the default CUDA device selection.
+
+Synthesize audio by sending a POST request:
+
+```
+curl -X POST \
+  http://localhost:8000/tts \
+  -H "Content-Type: application/json" \
+  -o output.wav \
+  -d '{"text": "Hello from Chatterbox!"}'
+```
+
+The `/health` endpoint returns the server status and output sample rate.
+
 # Benchmarks
 
 To run a benchmark, tweak and run `benchmark.py`.
