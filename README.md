@@ -103,7 +103,9 @@ Start the server with:
 uvicorn chatterbox_vllm.api:app --host 0.0.0.0 --port 8000
 ```
 
-Set `CHATTERBOX_CKPT_DIR` to reuse existing checkpoints, or `CHATTERBOX_TARGET_DEVICE` to override the default CUDA device selection.
+Set `CHATTERBOX_CKPT_DIR` to reuse existing checkpoints. The server will automatically prefer CUDA when available and otherwise
+fall back to CPU execution. To force a specific device, set `CHATTERBOX_TARGET_DEVICE` (for example `cpu` when running without
+GPU support).
 
 Synthesize audio by sending a POST request:
 

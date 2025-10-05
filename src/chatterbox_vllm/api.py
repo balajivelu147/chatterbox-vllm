@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import io
+import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Optional
 
 import numpy as np
+import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -53,6 +55,9 @@ class HealthResponse(BaseModel):
     sample_rate: int
 
 
+_logger = logging.getLogger(__name__)
+
+
 _tts_instance: ChatterboxTTS | None = None
 _tts_lock = asyncio.Lock()
 
@@ -65,22 +70,43 @@ def _create_executor() -> ThreadPoolExecutor:
 _executor = _create_executor()
 
 
+def _candidate_devices() -> list[str]:
+    requested = os.getenv("CHATTERBOX_TARGET_DEVICE")
+    if requested:
+        return [requested]
+
+    devices: list[str] = []
+    if torch.cuda.is_available():
+        devices.append("cuda")
+    devices.append("cpu")
+    return devices
+
+
 def _load_tts() -> ChatterboxTTS:
     ckpt_dir = os.getenv("CHATTERBOX_CKPT_DIR")
-    target_device = os.getenv("CHATTERBOX_TARGET_DEVICE", "cuda")
-    if ckpt_dir:
-        return ChatterboxTTS.from_local(
-            ckpt_dir,
-            target_device=target_device,
-        )
-
     repo_id = os.getenv("CHATTERBOX_REPO_ID", REPO_ID)
     revision = os.getenv("CHATTERBOX_REVISION", "1b475dffa71fb191cb6d5901215eb6f55635a9b6")
-    return ChatterboxTTS.from_pretrained(
-        repo_id=repo_id,
-        revision=revision,
-        target_device=target_device,
-    )
+
+    attempts = []
+    for device in _candidate_devices():
+        try:
+            if ckpt_dir:
+                return ChatterboxTTS.from_local(
+                    ckpt_dir,
+                    target_device=device,
+                )
+
+            return ChatterboxTTS.from_pretrained(
+                repo_id=repo_id,
+                revision=revision,
+                target_device=device,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            _logger.exception("Failed to initialize ChatterboxTTS on %s", device)
+            attempts.append(f"{device}: {exc}")
+
+    details = "; ".join(attempts) if attempts else "no devices attempted"
+    raise RuntimeError(f"Unable to initialize ChatterboxTTS ({details})")
 
 
 async def get_tts() -> ChatterboxTTS:
@@ -93,7 +119,11 @@ async def get_tts() -> ChatterboxTTS:
     async with _tts_lock:
         if _tts_instance is None:
             loop = asyncio.get_running_loop()
-            _tts_instance = await loop.run_in_executor(_executor, _load_tts)
+            try:
+                _tts_instance = await loop.run_in_executor(_executor, _load_tts)
+            except Exception as exc:  # pragma: no cover - defensive
+                _logger.exception("Unable to load ChatterboxTTS")
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
     return _tts_instance
 
 
