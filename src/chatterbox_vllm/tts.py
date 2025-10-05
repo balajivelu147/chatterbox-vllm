@@ -1,16 +1,16 @@
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional, Union, Tuple, Any
+import os
 import time
-
-from vllm import LLM, SamplingParams
+from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
+from typing import Any, Optional, Tuple, Union
 
 import librosa
 import torch
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
+from vllm import LLM, SamplingParams
 
 from chatterbox_vllm.models.t3.modules.t3_config import T3Config
 
@@ -85,7 +85,7 @@ class ChatterboxTTS:
     @classmethod
     def from_local(cls, ckpt_dir: str | Path, target_device: str = "cuda", 
                    max_model_len: int = 1000, compile: bool = False,
-                   max_batch_size: int = 10,
+                   max_batch_size: int = 1,
 
                    # Original Chatterbox defaults this to False. I don't see a substantial performance difference when running with FP16.
                    s3gen_use_fp16: bool = False,
@@ -109,28 +109,100 @@ class ChatterboxTTS:
         t3_speech_pos_emb.load_state_dict({ k.replace('speech_pos_emb.', ''):v for k,v in t3_weights.items() if k.startswith('speech_pos_emb.') })
         t3_speech_pos_emb = t3_speech_pos_emb.to(device=target_device).eval()
 
-        total_gpu_memory = torch.cuda.get_device_properties(0).total_memory
-        unused_gpu_memory = total_gpu_memory - torch.cuda.memory_allocated()
-        
-        # Heuristic: rough calculation for what percentage of GPU memory to give to vLLM.
-        # Tune this until the 'Maximum concurrency for ___ tokens per request: ___x' is just over 1.
-        # This rough heuristic gives 1.55GB for the model weights plus 128KB per token.
-        vllm_memory_needed = (1.55*1024*1024*1024) + (max_batch_size * max_model_len * 1024 * 128)
-        vllm_memory_percent = vllm_memory_needed / unused_gpu_memory
+        gpu_util_env = os.getenv("CHATTERBOX_VLLM_GPU_UTILIZATION")
+        gpu_memory_utilization: float
+        if gpu_util_env is not None:
+            try:
+                gpu_memory_utilization = float(gpu_util_env)
+            except ValueError as exc:
+                raise ValueError(
+                    "CHATTERBOX_VLLM_GPU_UTILIZATION must be a floating point value"
+                ) from exc
+            gpu_memory_utilization = max(0.01, min(0.5, gpu_memory_utilization))
+        else:
+            gpu_memory_utilization = 0.5
+            if torch.cuda.is_available():
+                try:
+                    free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info()
+                except RuntimeError:
+                    total_gpu_memory = torch.cuda.get_device_properties(0).total_memory
+                    free_gpu_memory = max(total_gpu_memory - torch.cuda.memory_allocated(), 1)
 
-        print(f"Giving vLLM {vllm_memory_percent * 100:.2f}% of GPU memory ({vllm_memory_needed / 1024**2:.2f} MB)")
+                if total_gpu_memory > 0:
+                    available_fraction = free_gpu_memory / total_gpu_memory
+                    if available_fraction < gpu_memory_utilization:
+                        adjusted_fraction = available_fraction * 0.9
+                        if adjusted_fraction < 0.1:
+                            print(
+                                "Warning: less than 12% of GPU memory is currently free; "
+                                "the loader will still request 10% for vLLM. Consider freeing "
+                                "additional VRAM or exporting CHATTERBOX_VLLM_GPU_UTILIZATION "
+                                "to skip the automatic backoff."
+                            )
+                            gpu_memory_utilization = 0.1
+                        else:
+                            gpu_memory_utilization = adjusted_fraction
+                            print(
+                                "Reducing vLLM GPU utilization to "
+                                f"{gpu_memory_utilization * 100:.2f}% based on free memory."
+                            )
+
+        swap_space_env = os.getenv("CHATTERBOX_VLLM_SWAP_SPACE_GB")
+        if swap_space_env is None:
+            swap_space = 4.0
+        else:
+            try:
+                swap_space = float(swap_space_env)
+            except ValueError as exc:
+                raise ValueError(
+                    "CHATTERBOX_VLLM_SWAP_SPACE_GB must be a floating point value"
+                ) from exc
+            swap_space = max(0.0, swap_space)
+
+        attention_backend = os.getenv("CHATTERBOX_VLLM_ATTENTION_BACKEND")
+        if attention_backend:
+            attention_backend = attention_backend.strip()
+        else:
+            attention_backend = "math"
+
+        print(
+            "Configuring vLLM with GPU memory utilization "
+            f"{gpu_memory_utilization * 100:.2f}% and swap space {swap_space:.1f} GB "
+            f"using attention backend '{attention_backend}'"
+        )
+
+        # Hard-cap vLLM to a single sequence so the initial profiling run does
+        # not reserve more KV cache blocks than the limited VRAM budget can
+        # sustain. Combined with the lower GPU memory utilization this avoids
+        # the CUDA device-side assertions observed during startup.
+        max_num_seqs = 1
 
         base_vllm_kwargs = {
             "model": "./t3-model",
             "task": "generate",
             "tokenizer": "EnTokenizer",
             "tokenizer_mode": "custom",
-            "gpu_memory_utilization": vllm_memory_percent,
+            "gpu_memory_utilization": gpu_memory_utilization,
             "enforce_eager": not compile,
             "max_model_len": max_model_len,
+            "max_num_seqs": max_num_seqs,
+            "max_num_batched_tokens": max_model_len * max_num_seqs,
+            "swap_space": swap_space,
         }
+        base_vllm_kwargs_with_backend = {**base_vllm_kwargs, "attention_backend": attention_backend}
 
-        t3 = LLM(**{**base_vllm_kwargs, **kwargs})
+        try:
+            t3 = LLM(**{**base_vllm_kwargs_with_backend, **kwargs})
+        except TypeError as exc:
+            if "attention_backend" not in str(exc):
+                raise
+
+            print(
+                "Installed vLLM does not accept 'attention_backend'; "
+                "falling back to the VLLM_ATTENTION_BACKEND environment variable."
+            )
+            os.environ["VLLM_ATTENTION_BACKEND"] = attention_backend
+            t3 = LLM(**{**base_vllm_kwargs, **kwargs})
 
         ve = VoiceEncoder()
         ve.load_state_dict(load_file(ckpt_dir / "ve.safetensors"))

@@ -67,6 +67,18 @@ If you encounter CUDA issues, try resetting the venv and using `uv pip install -
 
 [This example](https://github.com/randombk/chatterbox-vllm/blob/master/example-tts.py) can be run with `python example-tts.py` to generate audio samples for three different prompts using three different voices.
 
+### HTTP API
+
+To expose the model over HTTP, run the included FastAPI application with Uvicorn:
+
+```bash
+python tts_api.py
+```
+
+The server starts on port `8021` by default and provides a `POST /tts` endpoint that accepts JSON payloads with the text to synthesize and returns a WAV audio stream in the response body.
+
+> **Note:** The loader keeps vLLM at or below 50% of the GPU's VRAM and runs the decoder with a single active sequence to avoid the CUDA assertions reported on smaller cards. You can pin the VRAM share with `CHATTERBOX_VLLM_GPU_UTILIZATION`, choose a tighter context target via `CHATTERBOX_TTS_MAX_MODEL_LEN` (defaults to 500), select the attention backend with `CHATTERBOX_VLLM_ATTENTION_BACKEND` (defaults to `math` to sidestep Flash Attention issues; older vLLM builds fall back to `VLLM_ATTENTION_BACKEND` automatically), enable swap with `CHATTERBOX_VLLM_SWAP_SPACE_GB`, and tune the worker pool with `CHATTERBOX_TTS_WORKERS` before starting the server.
+
 ```python
 import torchaudio as ta
 from chatterbox_vllm.tts import ChatterboxTTS

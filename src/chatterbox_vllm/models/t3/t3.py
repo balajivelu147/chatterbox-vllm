@@ -294,6 +294,30 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
         self.cfg_scale = float(os.environ.get("CHATTERBOX_CFG_SCALE", "0.5"))
         print("Applying CFG scale:", self.cfg_scale)
 
+        # During the synthetic warmup run vLLM may feed random token IDs that do
+        # not respect the SPEECH_TOKEN_OFFSET contract. Keep track of whether a
+        # warning has already been emitted after clamping those IDs so operators
+        # understand why a message appeared on stderr.
+        self._warned_invalid_decode_tokens = False
+
+    def _speech_lookup(self, ids: torch.Tensor) -> torch.Tensor:
+        """Safely resolve speech token IDs for both warmup and real inference."""
+
+        shifted = ids - SPEECH_TOKEN_OFFSET
+        if shifted.numel() > 0:
+            min_id = shifted.min().item()
+            max_id = shifted.max().item()
+            num_embeddings = self.speech_emb.num_embeddings
+            if min_id < 0 or max_id >= num_embeddings:
+                if not self._warned_invalid_decode_tokens:
+                    print(
+                        "Warning: vLLM warmup emitted decode tokens outside the "
+                        "valid speech range; clamping them to avoid CUDA asserts."
+                    )
+                    self._warned_invalid_decode_tokens = True
+                shifted = shifted.clamp_(0, num_embeddings - 1)
+        return self.speech_emb(shifted)
+
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loaded_params: set[str] = set()
@@ -427,7 +451,7 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
             # There's no multimodal embeddings, so we're decoding.
             # Remember to undo the offset we applied to the speech tokens.
-            embeds = self.speech_emb(input_ids - SPEECH_TOKEN_OFFSET)
+            embeds = self._speech_lookup(input_ids)
 
             out = torch.cat([embeds, embeds], dim=1)
 
@@ -449,7 +473,7 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
                 if multimodal_embedding is None:
                     # There's no multimodal embeddings, so we're decoding.
                     # Remember to undo the offset we applied to the speech tokens.
-                    embeds = self.speech_emb(ids - SPEECH_TOKEN_OFFSET)
+                    embeds = self._speech_lookup(ids)
                     final_embeds = torch.cat([embeds, embeds], dim=1)
                     # assert len(final_embeds) == len(ids), "Number of output elements does not match number of input elements"
                     
